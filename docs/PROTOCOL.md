@@ -37,7 +37,9 @@ frame into the 595s:
 00 <hi> <lo> <ctl | 0x0A>
 ```
 
-The first byte falls off the end of the 24-bit chain. Control byte bits:
+The first byte falls off the end of the 24-bit chain, so it can be left out:
+3-byte frames `<hi> <lo> <ctl>` work and are ~28 % faster; the driver sends
+those by default. Control byte bits:
 
 | Bit | Meaning |
 |---|---|
@@ -54,11 +56,11 @@ pulse on CE0) does not work either.
 
 ### Clock
 
-| CDIV (400 MHz core) | SPI clock | Full frame | Result |
+| CDIV (400 MHz core) | SPI clock | Full frame (3-byte frames) | Result |
 |---|---|---|---|
-| 16 | 25 MHz | 0.52 s | clean, driver default |
-| 12 | 33 MHz | 0.40 s | clean |
-| 8 | 50 MHz | 0.29 s | corrupted: the panel resets and turns white |
+| 16 | 25 MHz | 0.40 s | clean, driver default |
+| 12 | 33 MHz | 0.32 s | clean |
+| 8 | 50 MHz | — | corrupted: the panel resets and turns white |
 
 ## LCD init
 
@@ -103,6 +105,19 @@ pixels…
 Each 16-bit window value is sent as two parameter words (high byte, low
 byte). The driver re-sends the window for every row it updates and only sends
 the span between the first and last changed pixel of that row.
+
+## Hardware scrolling
+
+The controller's vertical scrolling works and runs along the panel's native
+480-line axis, which is horizontal in this landscape orientation:
+
+```
+CMD 33  00 00  01 E0  00 00      scroll area: all 480 lines
+CMD 37  <hi> <lo>                scroll start v: screen x shows memory column (x + v) mod 480
+```
+
+Moving the picture costs one command; only the columns that come in at the
+edge need drawing. `CMD 37 00 00` restores the normal view.
 
 ## Touch
 

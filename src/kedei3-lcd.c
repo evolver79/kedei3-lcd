@@ -29,6 +29,7 @@
 //
 // Environment:
 //   KEDEI_SPI_CDIV   SPI clock divider (default 16, 25 MHz at a 400 MHz core)
+//   KEDEI_FRAME_BYTES  3 (default) or 4: send the vendor's leading zero byte
 //   KEDEI_INIT       panel settings: "v63" (default, KeDei's v6.3 kernel) or
 //                    "v11" (the v1.1 board's, paler with visible lines here)
 
@@ -80,12 +81,18 @@ static void gpio_mode(int pin, int mode)
 
 static void msleep(int ms) { usleep(ms * 1000); }
 
+// The 595 chain holds 24 bits, so the leading zero byte of the vendor's
+// 4-byte frames only falls off the end. Leaving it out is ~28 % faster;
+// KEDEI_FRAME_BYTES=4 sends it anyway.
+static int frame_bytes = 3;
+
 static void frame(uint8_t hi, uint8_t lo, uint8_t ctl)
 {
 	spi[0] = CS_LCD | CS_TA | CS_CLEAR_TX | CS_CLEAR_RX;
 	while (!(spi[0] & CS_TXD))
 		;
-	spi[1] = 0x00;
+	if (frame_bytes == 4)
+		spi[1] = 0x00;
 	spi[1] = hi;
 	spi[1] = lo;
 	spi[1] = ctl;
@@ -163,6 +170,9 @@ static void hw_init(void)
 	gpio_mode(10, 4); // ALT0: MOSI
 	gpio_mode(11, 4); // ALT0: SCLK
 	spi[2] = spi_cdiv;
+	const char *fbytes = getenv("KEDEI_FRAME_BYTES");
+	if (fbytes && atoi(fbytes) == 4)
+		frame_bytes = 4;
 }
 
 // Panel settings from KeDei's v6.3 kernel: better contrast and no visible
@@ -421,6 +431,20 @@ static void test(void)
 	       (b.tv_sec - a.tv_sec) + (b.tv_nsec - a.tv_nsec) / 1e9);
 }
 
+// Draws the colour bars, then scrolls them sideways with the controller's
+// vertical scrolling (the panel's native vertical is our horizontal).
+static void scrolltest(void)
+{
+	test();
+	CMD(0x33, 0x00, 0x00, 0x01, 0xE0, 0x00, 0x00); // whole 480 lines scroll
+	for (int round = 0; round < 2; round++)
+		for (int v = 0; v < W; v += 4) {
+			CMD(0x37, v >> 8, v & 0xFF);
+			msleep(10);
+		}
+	CMD(0x37, 0x00, 0x00);
+}
+
 // Pushes only the rectangle x0..x1, y0..y1 (inclusive), one row at a time.
 static void push_rect(const uint16_t *src, int x0, int y0, int x1, int y1)
 {
@@ -647,22 +671,41 @@ static int read_raw(const char *path, struct timespec *last)
 	return ok;
 }
 
-// Push only what changed since the last sync: in each changed row, the span
-// from the first to the last changed pixel.
-static void sync_rows(void)
+// Setting a window costs 11 words, as much as 11 pixels, so unchanged gaps
+// shorter than this are sent along with the changes around them.
+#define GAP_PIXELS 12
+
+// Push the runs of pixels that differ between now and was (both W x H) in
+// rows y0, y0 + step, ... and bring was up to date.
+static void push_diff_rows(const uint16_t *now, uint16_t *was, int y0, int step)
 {
-	for (int y = 0; y < H; y++) {
-		const uint16_t *now = fb + y * W, *was = shadow + y * W;
-		int x0 = 0, x1 = W - 1;
-		while (x0 < W && now[x0] == was[x0])
-			x0++;
-		if (x0 == W)
-			continue;
-		while (now[x1] == was[x1])
-			x1--;
-		push_rect(fb, x0, y, x1, y);
-		memcpy(shadow + y * W + x0, now + x0, (x1 - x0 + 1) * 2);
+	for (int y = y0; y < H; y += step) {
+		const uint16_t *n = now + y * W;
+		uint16_t *w = was + y * W;
+		for (int x = 0; x < W;) {
+			while (x < W && n[x] == w[x])
+				x++;
+			if (x == W)
+				break;
+			int x0 = x, x1 = x, gap = 0;
+			for (x++; x < W && gap < GAP_PIXELS; x++) {
+				if (n[x] != w[x]) {
+					x1 = x;
+					gap = 0;
+				} else {
+					gap++;
+				}
+			}
+			push_rect(now, x0, y, x1, y);
+			memcpy(w + x0, n + x0, (x1 - x0 + 1) * 2);
+			x = x1 + 1;
+		}
 	}
+}
+
+static void push_diff(const uint16_t *now, uint16_t *was)
+{
+	push_diff_rows(now, was, 0, 1);
 }
 
 // Draws a cross at (cx, cy) on black and waits for a press on it; returns the
@@ -755,20 +798,22 @@ static void daemon_loop(const char *path)
 				// late), so keep retrying every 2 s until it can be mapped.
 				if (src_fb.mem || (tick % 100 == 0 && open_fb(path) == 0)) {
 					read_fb();
-					sync_rows();
+					push_diff(fb, shadow);
 				}
 			} else if (read_raw(path, &last)) {
-				sync_rows();
+				push_diff(fb, shadow);
 			}
 		}
 		usleep(20 * 1000);
 	}
 }
 
+// demos/ include this file with KEDEI3_NO_MAIN to reuse the driver.
+#ifndef KEDEI3_NO_MAIN
 int main(int argc, char **argv)
 {
 	if (argc < 2 || (strcmp(argv[1], "test") && strcmp(argv[1], "calibrate") &&
-			 strcmp(argv[1], "demo") && argc < 3)) {
+			 strcmp(argv[1], "demo") && strcmp(argv[1], "scrolltest") && argc < 3)) {
 		fprintf(stderr, "usage: %s test | demo [seconds] | calibrate | daemon <src>\n", argv[0]);
 		return 2;
 	}
@@ -781,9 +826,12 @@ int main(int argc, char **argv)
 		test();
 	else if (!strcmp(argv[1], "calibrate"))
 		calibrate();
+	else if (!strcmp(argv[1], "scrolltest"))
+		scrolltest();
 	else if (!strcmp(argv[1], "demo"))
 		demo(argc > 2 ? atoi(argv[2]) : 20);
 	else
 		daemon_loop(argv[2]);
 	return 0;
 }
+#endif
