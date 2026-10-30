@@ -57,16 +57,36 @@ sudo systemctl stop kedei3-lcd && sudo kedei3-lcd calibrate && sudo systemctl st
 
 ## Performance
 
-A full-screen redraw takes about 0.5 s at the default 25 MHz SPI clock;
-typical desktop updates (menus, terminal text) only redraw the changed rows
-and feel responsive. Video and games are not realistic. To try a faster
-clock, add `Environment=KEDEI_SPI_CDIV=8` (50 MHz) with
-`sudo systemctl edit kedei3-lcd` and check the picture for glitches.
+Only the changed pixels of each row are sent, so small updates are fast while
+full-screen changes are slow:
+
+| Update | At 25 MHz (default) | At 33 MHz |
+|---|---|---|
+| Full screen | 0.52 s | 0.40 s |
+| `kedei3-lcd demo` (four 40 px balls) | 28.7 fps | 39.8 fps |
+
+Clocks, counters, menus and terminal text feel responsive; video and
+full-screen games are not realistic. Every pixel costs two 32-bit transfers
+through the shift registers, which caps full-screen updates at about 5 fps
+even at the fastest clock the board accepts.
+
+The tested board runs cleanly at 33 MHz but turns white (corrupted frames
+reset the panel) at 50 MHz. To use 33 MHz:
+
+```sh
+sudo systemctl edit kedei3-lcd   # add the two lines below
+[Service]
+Environment=KEDEI_SPI_CDIV=12
+```
+
+Run `kedei3-lcd demo` with the service stopped to check a setting first:
+`sudo systemctl stop kedei3-lcd && sudo KEDEI_SPI_CDIV=12 kedei3-lcd demo 30`.
 
 ## Usage
 
 ```
 kedei3-lcd test             init and draw colour bars
+kedei3-lcd demo [seconds]   bouncing balls with an FPS counter
 kedei3-lcd daemon <src>     mirror a framebuffer device or raw 480x320 RGB565 file
 kedei3-lcd calibrate        touch calibration, saved to /etc/kedei-touch.conf
 ```
@@ -74,7 +94,7 @@ kedei3-lcd calibrate        touch calibration, saved to /etc/kedei-touch.conf
 Environment: `KEDEI_SPI_CDIV` (SPI clock divider, default 16) and
 `KEDEI_INIT` (`v63` panel settings, the default, or `v11`).
 
-Stop the service before running `test` or `calibrate`: only one program may
+Stop the service before running `test`, `demo` or `calibrate`: only one program may
 drive SPI0 at a time.
 
 ## Other KeDei boards

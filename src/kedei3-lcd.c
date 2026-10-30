@@ -21,6 +21,7 @@
 //                               RGB565 little-endian file; the touchscreen is
 //                               exposed as the uinput device "KeDei Touch"
 //   kedei3-lcd calibrate        show four targets, write the touch calibration
+//   kedei3-lcd demo [seconds]   bouncing balls with an FPS counter
 //
 // Touch: XPT2046 on CE0 (SPI mode 0), PENIRQ on GPIO25. Calibration lives in
 // /etc/kedei-touch.conf as "xmin xmax ymin ymax swap_xy": the raw readings at
@@ -420,6 +421,145 @@ static void test(void)
 	       (b.tv_sec - a.tv_sec) + (b.tv_nsec - a.tv_nsec) / 1e9);
 }
 
+// Pushes only the rectangle x0..x1, y0..y1 (inclusive), one row at a time.
+static void push_rect(const uint16_t *src, int x0, int y0, int x1, int y1)
+{
+	for (int y = y0; y <= y1; y++) {
+		window(x0, y, x1, H - 1);
+		for (int x = x0; x <= x1; x++)
+			word(CTL_DATA, src[y * W + x] >> 8, src[y * W + x] & 0xFF);
+	}
+}
+
+static uint16_t rgb(int r, int g, int b)
+{
+	return (r >> 3) << 11 | (g >> 2) << 5 | b >> 3;
+}
+
+static double now(void)
+{
+	struct timespec t;
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return t.tv_sec + t.tv_nsec / 1e9;
+}
+
+// 7-segment digit, 16x28 pixels.
+static void draw_digit(uint16_t *dst, int d, int x, int y, uint16_t c)
+{
+	static const uint8_t on[10] = {0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F};
+	static const int seg[7][4] = {{3, 0, 10, 3},  {13, 2, 3, 12}, {13, 14, 3, 12}, {3, 25, 10, 3},
+				      {0, 14, 3, 12}, {0, 2, 3, 12},  {3, 12, 10, 4}};
+	for (int s = 0; s < 7; s++)
+		if (on[d] & (1 << s))
+			for (int j = 0; j < seg[s][3]; j++)
+				for (int i = 0; i < seg[s][2]; i++)
+					dst[(y + seg[s][1] + j) * W + x + seg[s][0] + i] = c;
+}
+
+#define BALLS 4
+#define R 20
+
+// Bouncing shaded balls and an FPS counter, redrawing only the rectangles
+// that change: shows how fast small moving things can be on this bus.
+static void demo(int seconds)
+{
+	static uint16_t bg[W * H], sprite[BALLS][2 * R][2 * R];
+	static const int base[BALLS][3] = {{255, 70, 60}, {80, 220, 90}, {70, 140, 255}, {255, 210, 60}};
+	double px[BALLS], py[BALLS], vx[BALLS], vy[BALLS];
+	int ox[BALLS], oy[BALLS];
+
+	for (int y = 0; y < H; y++)
+		for (int x = 0; x < W; x++)
+			bg[y * W + x] = rgb(15 + 60 * y / H, 20 + 10 * y / H, 50 + 50 * y / H);
+	// Shaded spheres with a highlight at the upper left; 0 marks transparent.
+	for (int b = 0; b < BALLS; b++)
+		for (int j = 0; j < 2 * R; j++)
+			for (int i = 0; i < 2 * R; i++) {
+				int dx = i - R, dy = j - R, d2 = dx * dx + dy * dy;
+				if (d2 >= R * R) {
+					sprite[b][j][i] = 0;
+					continue;
+				}
+				int hx = dx + R / 3, hy = dy + R / 3, h2 = hx * hx + hy * hy;
+				int shade = 255 - d2 * 150 / (R * R);
+				int hl = h2 < R * R / 4 ? 200 - h2 * 800 / (R * R) : 0;
+				int c[3];
+				for (int k = 0; k < 3; k++) {
+					c[k] = base[b][k] * shade / 255 + hl;
+					c[k] = c[k] > 255 ? 255 : c[k];
+				}
+				sprite[b][j][i] = rgb(c[0], c[1], c[2]) | 1;
+			}
+	for (int b = 0; b < BALLS; b++) {
+		px[b] = 40 + b * 100;
+		py[b] = 60 + b * 50;
+		vx[b] = (b % 2 ? -1 : 1) * (140 + b * 30);
+		vy[b] = (b % 3 ? 1 : -1) * (120 + b * 25);
+		ox[b] = px[b];
+		oy[b] = py[b];
+	}
+
+	memcpy(fb, bg, sizeof(fb));
+	push_rows(fb, 0, H - 1);
+
+	double start = now(), last = start, fps_at = start;
+	int frames = 0, fps_frames = 0;
+	while (now() - start < seconds) {
+		double t = now(), dt = t - last;
+		last = t;
+		int nx[BALLS], ny[BALLS];
+		for (int b = 0; b < BALLS; b++) {
+			px[b] += vx[b] * dt;
+			py[b] += vy[b] * dt;
+			if (px[b] < 0 || px[b] > W - 2 * R) {
+				vx[b] = -vx[b];
+				px[b] = px[b] < 0 ? 0 : W - 2 * R;
+			}
+			if (py[b] < 0 || py[b] > H - 2 * R) {
+				vy[b] = -vy[b];
+				py[b] = py[b] < 0 ? 0 : H - 2 * R;
+			}
+			nx[b] = px[b];
+			ny[b] = py[b];
+		}
+		// Dirty rectangle per ball: its old and new position together.
+		int rect[BALLS][4];
+		for (int b = 0; b < BALLS; b++) {
+			rect[b][0] = ox[b] < nx[b] ? ox[b] : nx[b];
+			rect[b][1] = oy[b] < ny[b] ? oy[b] : ny[b];
+			rect[b][2] = (ox[b] > nx[b] ? ox[b] : nx[b]) + 2 * R - 1;
+			rect[b][3] = (oy[b] > ny[b] ? oy[b] : ny[b]) + 2 * R - 1;
+			for (int y = rect[b][1]; y <= rect[b][3]; y++)
+				memcpy(fb + y * W + rect[b][0], bg + y * W + rect[b][0],
+				       (rect[b][2] - rect[b][0] + 1) * 2);
+		}
+		for (int b = 0; b < BALLS; b++)
+			for (int j = 0; j < 2 * R; j++)
+				for (int i = 0; i < 2 * R; i++)
+					if (sprite[b][j][i])
+						fb[(ny[b] + j) * W + nx[b] + i] = sprite[b][j][i];
+		for (int b = 0; b < BALLS; b++) {
+			push_rect(fb, rect[b][0], rect[b][1], rect[b][2], rect[b][3]);
+			ox[b] = nx[b];
+			oy[b] = ny[b];
+		}
+		frames++;
+		fps_frames++;
+		if (t - fps_at >= 0.5) {
+			int fps = fps_frames / (t - fps_at);
+			fps = fps > 999 ? 999 : fps;
+			for (int y = 8; y < 8 + 28; y++)
+				memcpy(fb + y * W + 8, bg + y * W + 8, 60 * 2);
+			for (int i = 0, div = 100; i < 3; i++, div /= 10)
+				draw_digit(fb, fps / div % 10, 8 + i * 20, 8, 0xFFFF);
+			push_rect(fb, 8, 8, 67, 35);
+			fps_at = t;
+			fps_frames = 0;
+		}
+	}
+	printf("%d frames in %ds: %.1f fps\n", frames, seconds, frames / (now() - start));
+}
+
 // A framebuffer device, mapped once; its geometry comes from sysfs.
 static struct {
 	const uint8_t *mem;
@@ -507,14 +647,22 @@ static int read_raw(const char *path, struct timespec *last)
 	return ok;
 }
 
-// Push only the rows that changed since the last sync.
+// Push only what changed since the last sync: in each changed row, the span
+// from the first to the last changed pixel.
 static void sync_rows(void)
 {
-	for (int y = 0; y < H; y++)
-		if (memcmp(fb + y * W, shadow + y * W, W * 2)) {
-			push_rows(fb, y, y);
-			memcpy(shadow + y * W, fb + y * W, W * 2);
-		}
+	for (int y = 0; y < H; y++) {
+		const uint16_t *now = fb + y * W, *was = shadow + y * W;
+		int x0 = 0, x1 = W - 1;
+		while (x0 < W && now[x0] == was[x0])
+			x0++;
+		if (x0 == W)
+			continue;
+		while (now[x1] == was[x1])
+			x1--;
+		push_rect(fb, x0, y, x1, y);
+		memcpy(shadow + y * W + x0, now + x0, (x1 - x0 + 1) * 2);
+	}
 }
 
 // Draws a cross at (cx, cy) on black and waits for a press on it; returns the
@@ -619,8 +767,9 @@ static void daemon_loop(const char *path)
 
 int main(int argc, char **argv)
 {
-	if (argc < 2 || (strcmp(argv[1], "test") && strcmp(argv[1], "calibrate") && argc < 3)) {
-		fprintf(stderr, "usage: %s test | calibrate | daemon <src>\n", argv[0]);
+	if (argc < 2 || (strcmp(argv[1], "test") && strcmp(argv[1], "calibrate") &&
+			 strcmp(argv[1], "demo") && argc < 3)) {
+		fprintf(stderr, "usage: %s test | demo [seconds] | calibrate | daemon <src>\n", argv[0]);
 		return 2;
 	}
 	const char *cdiv = getenv("KEDEI_SPI_CDIV");
@@ -632,6 +781,8 @@ int main(int argc, char **argv)
 		test();
 	else if (!strcmp(argv[1], "calibrate"))
 		calibrate();
+	else if (!strcmp(argv[1], "demo"))
+		demo(argc > 2 ? atoi(argv[2]) : 20);
 	else
 		daemon_loop(argv[2]);
 	return 0;

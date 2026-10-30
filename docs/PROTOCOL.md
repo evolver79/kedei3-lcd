@@ -54,9 +54,11 @@ pulse on CE0) does not work either.
 
 ### Clock
 
-25 MHz (CDIV 16 at the Pi 3's 400 MHz core clock) is the driver's default. A
-full 480×320 frame then takes 0.52 s. 50 MHz (CDIV 8) takes 0.29 s but has
-not been checked for corrupted frames; set `KEDEI_SPI_CDIV` to try it.
+| CDIV (400 MHz core) | SPI clock | Full frame | Result |
+|---|---|---|---|
+| 16 | 25 MHz | 0.52 s | clean, driver default |
+| 12 | 33 MHz | 0.40 s | clean |
+| 8 | 50 MHz | 0.29 s | corrupted: the panel resets and turns white |
 
 ## LCD init
 
@@ -99,7 +101,8 @@ pixels…
 ```
 
 Each 16-bit window value is sent as two parameter words (high byte, low
-byte). The driver re-sends the window for every row it updates.
+byte). The driver re-sends the window for every row it updates and only sends
+the span between the first and last changed pixel of that row.
 
 ## Touch
 
