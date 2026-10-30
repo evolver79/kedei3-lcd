@@ -1,0 +1,14 @@
+[Unit]
+Description=KeDei 3.5" v3 SPI LCD driver
+DefaultDependencies=no
+After=local-fs.target
+Before=display-manager.service
+
+[Service]
+Environment=KEDEI_SPI_CDIV=16
+ExecStart=/usr/local/bin/kedei3-lcd daemon /dev/fb0
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
